@@ -1,0 +1,9 @@
+-mjx
+-i pi.ihx
+-k /opt/local/share/sdcc/lib/z80
+-l z80
+cpm0.rel
+pi.rel
+cpmbdos.rel
+cprintf.rel
+-e
