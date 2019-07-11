@@ -1,0 +1,1606 @@
+ca65 V2.13.2 - (C) Copyright 1998-2005 Ullrich von Bassewitz
+Main file   : apple1pi.s
+Current file: apple1pi.s
+
+000000r 1               ;; Apple-1 Pi
+000000r 1               ;;
+000000r 1               ;; Mar, 12 2013
+000000r 1               ;;
+000000r 1               ;; Egan Ford (egan@sense.net) with a lot of optimizations and pointers from
+000000r 1               ;; Anton Treuenfels (atreuenfels@earthlink.net)
+000000r 1               ;;
+000000r 1               ;; (c) 2013, All Rights Reserved, Egan Ford (egan@sense.net)
+000000r 1               ;;
+000000r 1               ;; THIS CODE AND INFORMATION ARE PROVIDED "AS IS" WITHOUT WARRANTY OF ANY
+000000r 1               ;; KIND, EITHER EXPRESSED OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE
+000000r 1               ;; IMPLIED WARRANTIES OF MERCHANTABILITY AND/OR FITNESS FOR A
+000000r 1               ;; PARTICULAR PURPOSE.
+000000r 1               ;;
+000000r 1               ;; Apple-1 Pi will compute 1000 decimal digits of Pi.
+000000r 1               ;;
+000000r 1               ;; All Apple-1 Pi computation is base 256 and then converted to base 10 for
+000000r 1               ;; display (technically base 100, but they both display the same).  Arrays
+000000r 1               ;; of bytes are used to represent multiprecision numbers.  In the comments
+000000r 1               ;; below "array" refers to a big endian multiprecision number.
+000000r 1               ;;
+000000r 1               ;; C snippets:  J.W. Stumpel, (c) May 1991
+000000r 1               ;;
+000000r 1               ;; Assembler: ca65
+000000r 1               ;;
+000000r 1               
+000000r 1               ;; Apple-1 variables/vectors
+000000r 1               
+000000r 1               apple	=	1
+000000r 1               	.if	apple = 1
+000000r 1               cout	=	$FFEF		; character out sub
+000000r 1               prbyte	=	$FFDC		; print a hex byte
+000000r 1               warm	=	$FF1F		; back to monitor
+000000r 1               org	=	$280		; start here
+000000r 1               	.else
+000000r 1               cout	=	$FDED		; character out sub
+000000r 1               prbyte	=	$FDDA		; print a hex byte
+000000r 1               warm	=	$FF69		; back to monitor
+000000r 1               org	=	$800		; start here
+000000r 1               	.endif
+000000r 1               
+000000r 1               
+000000r 1               ;; my global variables/vectors
+000000r 1               
+000000r 1               ptr	=	$0		; $0-$1 16 bit generic pointer
+000000r 1               ptr_mp	=	$2		; $2-$3 16 bit generic pointer
+000000r 1               a32	=	$4		; $4-$7 32 bit number
+000000r 1               carry_mp=	$4		; $4-$4  8 bit multiprecision carry
+000000r 1               				;          32/16 div
+000000r 1               dividend=	$4		; $4-$7 32 bit
+000000r 1               remainder=	$4		; $4-$5 16 bit
+000000r 1               quotient=	$6		; $6-$7 16 bit
+000000r 1               divisor	=	$8		; $8-$9 16 bit
+000000r 1               				;          backup regs
+000000r 1               yreg	=	$A		; $A-$A  8 bit
+000000r 1               xreg	=	$B		; $B-$B  8 bit
+000000r 1               dlength	=	$C		; $C-$D	16 bit
+000000r 1               
+000000r 1               
+000000r 1               dec_len	=	1000		; 1000 decimal digits
+000000r 1               bin_len	=	418		; ceil(1001 / log(256)) + 1 (+ 1 if odd) = 418
+000000r 1               bin_end	=	bin_len-1
+000000r 1               bcd_len	=	dec_len/2
+000000r 1               
+000000r 1               
+000000r 1               ;; start of global macros
+000000r 1               
+000000r 1               .include	"pimacros.m"
+000000r 2               .macro	cnton num
+000000r 2               	sta	$E100+num
+000000r 2               .endmacro
+000000r 2               
+000000r 2               .macro	cntoff num
+000000r 2               	sta	$E200+num
+000000r 2               .endmacro
+000000r 2               
+000000r 2               .macro	chkpt num
+000000r 2               	sta	$E300+num
+000000r 2               .endmacro
+000000r 2               
+000000r 2               ; Description:	Load A/Y registers with a 16-bit value,
+000000r 2               ;               low byte in A, high byte in Y
+000000r 2               ; Input:        value (16-bit) immediate, absolute and zero-page addressing
+000000r 2               
+000000r 2               .macro	lday	value
+000000r 2               	.if (.match (.left (1, {value}), #))
+000000r 2               		lda	#<(.right (.tcount ({value})-1, {value}))
+000000r 2               		ldy	#>(.right (.tcount ({value})-1, {value}))
+000000r 2               	.else
+000000r 2               		lda	value
+000000r 2               		ldy	value+1
+000000r 2               	.endif
+000000r 2               .endmacro
+000000r 2               
+000000r 2               
+000000r 2               ; Description:  Store 16-bit value in A/Y registers to memory,
+000000r 2               ;               low byte in A, high byte in Y
+000000r 2               ; Input:        value (16-bit), absolute and zero-page addressing
+000000r 2               
+000000r 2               .macro	stay	location
+000000r 2               	sta	location
+000000r 2               	sty	location+1
+000000r 2               .endmacro
+000000r 2               
+000000r 2               
+000000r 2               ; Description:	Allocate an array of size "sizeof" at "ptr"
+000000r 2               ; Input:	ptr (16-bit), sizeof (16-bit)
+000000r 2               ;		ptr = pointer to start of memory (if successful)
+000000r 2               ;		sizeof = length of requested memory, length can be
+000000r 2               ;		immediate (e.g. #1000) or absolute/zp (label)
+000000r 2               ; Calls:	malloc, if malloc fails then calls malloc_error and dies
+000000r 2               ;		program.
+000000r 2               
+000000r 2               .macro	alloc	ptr, sizeof
+000000r 2               	lday	sizeof
+000000r 2               	jsr	malloc		; call malloc
+000000r 2               	bcc	:+		; if not failure (bcc) set ptr lo/hi
+000000r 2               	jmp	malloc_error	; on failure jmp to malloc_error and die
+000000r 2               :	stay	ptr
+000000r 2               .endmacro
+000000r 2               
+000000r 2               
+000000r 2               ; Description:	Set initial value left of decimal of "ptr_a" array to
+000000r 2               ;		"value", i.e. (ptr_a),0 = value
+000000r 2               ; Input:	ptr_a (16-bit), value (8-bit)
+000000r 2               ;		ptr_a = pointer to start of allocated array
+000000r 2               ;		value = integer to be set left of decimal point
+000000r 2               ; Calls:	set_mp
+000000r 2               
+000000r 2               .macro	mset	ptr_a, value	; a = value
+000000r 2               cnton 19
+000000r 2               	lday	ptr_a
+000000r 2               	ldx	value
+000000r 2               	jsr	set_mp		; set it
+000000r 2               cntoff 19
+000000r 2               .endmacro
+000000r 2               
+000000r 2               
+000000r 2               ; Description:	Transfer array (ptr_b)[0,sizeof(ptr_b)] to ptr_a (a = b)
+000000r 2               ; Input:	ptr_a (16-bit), ptr_b (16-bit)
+000000r 2               ;		ptr_a = pointer to start of allocated array
+000000r 2               ;		ptr_b = pointer to start of allocated array
+000000r 2               ; Calls:	copy_mp
+000000r 2               
+000000r 2               .macro	mcopy	ptr_a, ptr_b	; a = b
+000000r 2               cnton 20
+000000r 2               	lday	ptr_a
+000000r 2               	stay	ptr_mp
+000000r 2               	lday	ptr_b
+000000r 2               	jsr	copy_mp		; copy it
+000000r 2               cntoff 20
+000000r 2               .endmacro
+000000r 2               
+000000r 2               
+000000r 2               ; Description:	Left shift array ptr_a
+000000r 2               ; Input:	ptr_a (16-bit)
+000000r 2               ;		ptr_a = pointer to start of allocated array
+000000r 2               ; Calls:	asl_mp
+000000r 2               
+000000r 2               .macro	masl	ptr_a		; a = a * 2
+000000r 2               cnton 21
+000000r 2               	lday	ptr_a
+000000r 2               	jsr	asl_mp		; left shift it
+000000r 2               cntoff 21
+000000r 2               .endmacro
+000000r 2               
+000000r 2               
+000000r 2               ; Description:	Add array ptr_b to array ptr_a (a = a + b)
+000000r 2               ; Input:	ptr_a (16-bit), ptr_b (16-bit)
+000000r 2               ;		ptr_a = pointer to start of allocated array
+000000r 2               ;		ptr_b = pointer to start of allocated array
+000000r 2               ; Calls:	add_mp
+000000r 2               
+000000r 2               .macro	madd	ptr_a, ptr_b	; a = a + b
+000000r 2               cnton 22
+000000r 2               	lday	ptr_b
+000000r 2               	stay	ptr_mp
+000000r 2               	lday	ptr_a
+000000r 2               	jsr	add_mp		; add it
+000000r 2               cntoff 22
+000000r 2               .endmacro
+000000r 2               
+000000r 2               
+000000r 2               ; Description:	Subtract array ptr_b from array ptr_a (a = a - b)
+000000r 2               ; Input:	ptr_a (16-bit), ptr_b (16-bit)
+000000r 2               ;		ptr_a = pointer to start of allocated array
+000000r 2               ;		ptr_b = pointer to start of allocated array
+000000r 2               ; Calls:	sub_mp
+000000r 2               
+000000r 2               .macro	msub	ptr_a, ptr_b	; a = a - b
+000000r 2               cnton 23
+000000r 2               	lday	ptr_b
+000000r 2               	stay	ptr_mp
+000000r 2               	lday	ptr_a
+000000r 2               	jsr	sub_mp		; sub it
+000000r 2               cntoff 23
+000000r 2               .endmacro
+000000r 2               
+000000r 2               
+000000r 2               ; Description:	Divide ptr_a by an 8-bit quantity (a = a / divisor)
+000000r 2               ; Input:	ptr_a (16-bit), divisor (8-bit)
+000000r 2               ;		ptr_a = pointer to start of allocated array
+000000r 2               ;		divisor = 8-bit immediate or absolute/zp integer
+000000r 2               ; Calls:	div_mp
+000000r 2               ; Return:	If ptr_a = 0 (array of zeros), then carry is set,
+000000r 2               ;		otherwise carry is clear.
+000000r 2               
+000000r 2               .macro	mdiv	ptr_a, divisor	; a = a / divisor (8-bit)
+000000r 2               cnton 24
+000000r 2               	lday	ptr_a
+000000r 2               	ldx	divisor
+000000r 2               	jsr	div_mp		; div it
+000000r 2               cntoff 24
+000000r 2               .endmacro
+000000r 2               
+000000r 2               
+000000r 2               ; Description:	Divide ptr_a by a 16-bit quantity (a = a / value)
+000000r 2               ; Input:	ptr_a (16-bit), value (8-bit)
+000000r 2               ;		ptr_a = pointer to start of allocated array
+000000r 2               ;		value = 16-bit immediate or absolute/zp integer
+000000r 2               ; Calls:	div16_mp
+000000r 2               ; Return:	If ptr_a = 0 (array of zeros), then carry is set,
+000000r 2               ;		otherwise carry is clear
+000000r 2               
+000000r 2               .macro	mdiv16	ptr_a, value	; a = a / value (16-bit)
+000000r 2               cnton 25
+000000r 2               	lday	value
+000000r 2               	sty	divisor+0	; big-endian
+000000r 2               	sta	divisor+1
+000000r 2               	lday	ptr_a
+000000r 2               	jsr	div16_mp	; div it
+000000r 2               cntoff 25
+000000r 2               .endmacro
+000000r 2               
+000000r 2               
+000000r 2               ; Description:	Compute arctan(1/value) and store at ptr_a.
+000000r 2               ; Input:	ptr_a (16-bit), value (8-bit)
+000000r 2               ;		ptr_a = pointer to start of allocated array
+000000r 2               ;		value = 8-bit immediate or absolute/zp integer
+000000r 2               ; Calls:	atan_mp
+000000r 2               
+000000r 2               .macro	matan	ptr_a, value	; a = atan(1/value)
+000000r 2               cnton 26
+000000r 2               	lday	ptr_a
+000000r 2               	ldx	value
+000000r 2               	jsr	atan_mp		; atan it
+000000r 2               cntoff 26
+000000r 2               .endmacro
+000000r 2               
+000000r 2               
+000000r 2               ; Description:	Convert and print/display a base 256 number (ptr_a) as
+000000r 2               ;		base 10.
+000000r 2               ; Input:	ptr_a (16-bit)
+000000r 2               ;		ptr_a = pointer to start of allocated array
+000000r 2               ; Calls:	print_mp
+000000r 2               
+000000r 2               .macro	mprint	ptr_a		; print a (base 10)
+000000r 2               cnton 27
+000000r 2               	lday	ptr_a
+000000r 2               	jsr	print_mp	; print it
+000000r 2               cntoff 27
+000000r 2               .endmacro
+000000r 2               
+000000r 2               
+000000r 2               ; Description:	Print a string (arg) with an optional trailing character
+000000r 2               ;		(usually a carriage return (CR = $0D)).
+000000r 2               ; Input:	immediate with extra:		"string",$0D
+000000r 2               ;		immediate w/o extra:		"string"
+000000r 2               ;		absolue/zp label with extra:	label,$0D
+000000r 2               ;		absolue/zp label w/o extra:	label
+000000r 2               ; Calls:	print, crout
+000000r 2               
+000000r 2               .macro	sprint	arg, cr
+000000r 2               	.local	str
+000000r 2               	.local	skip
+000000r 2               	.if .match ({arg},"")
+000000r 2               		lday	#str
+000000r 2               		jsr	print
+000000r 2               		beq	skip
+000000r 2               	str:	.byte	arg
+000000r 2               	.ifnblank	cr
+000000r 2               		.byte	cr
+000000r 2               	.endif
+000000r 2               		.byte	$0
+000000r 2               	skip:
+000000r 2               	.else
+000000r 2               		lday	#arg
+000000r 2               		jsr	print
+000000r 2               		.ifnblank	cr
+000000r 2               		jsr	crout
+000000r 2               		.endif
+000000r 2               	.endif
+000000r 2               .endmacro
+000000r 2               
+000000r 1               
+000000r 1               ;; end of macros
+000000r 1               
+000000r 1               ;; start of real code
+000000r 1               	.org	org
+000280  1               main:
+000280  1  20 A9 0E     	jsr	crout		; print CR
+000283  1  20 A9 0E     	jsr	crout		; print CR
+000286  1               
+000286  1  A9 8F A0 02  	sprint	"1000 DIGITS OF PI = "
+00028A  1  20 96 0E F0  
+00028E  1  15 31 30 30  
+000292  1  30 20 44 49  
+000296  1  47 49 54 53  
+00029A  1  20 4F 46 20  
+00029E  1  50 49 20 3D  
+0002A2  1  20 00        
+0002A4  1  8D 01 E1     cnton 1
+0002A7  1  20 C0 02     	jsr	pi
+0002AA  1  8D 01 E2     cntoff 1
+0002AD  1  8D 1B E1 A9  	mprint	#mp_a		; print it (note mp_a hosed)
+0002B1  1  80 A0 11 20  
+0002B5  1  DC 0D 8D 1B  
+0002B9  1  E2           
+0002BA  1  20 A9 0E     	jsr	crout		; print CR
+0002BD  1  4C 1F FF     	jmp	warm
+0002C0  1               
+0002C0  1               
+0002C0  1               ;; start of subs
+0002C0  1               
+0002C0  1               ; Description: Compute pi using the Gregory expansion of Machin's arctan
+0002C0  1               ;              formula and save in array (mp_a) (hardcoded--bad).
+0002C0  1               ;
+0002C0  1               ;   pi = 4 * (4 *      atan(1/5)           -           atan(1/239)          )
+0002C0  1               ;
+0002C0  1               ;
+0002C0  1               ;   __      /   / 1     1      1       \       / 1       1        1        \\
+0002C0  1               ;   || = 4 | 4 |  - - ---- + ---- - ... |  -  | --- - ------ + ------ - ... ||
+0002C0  1               ;          |   |  5      3      5       |     | 239        3        5       ||
+0002C0  1               ;           \   \     3x5    5x5       /       \      3x239    5x239       //
+0002C0  1               ;
+0002C0  1               ;
+0002C0  1               ; Input:       None
+0002C0  1               ;
+0002C0  1               ; Output:      (mp_a) = pi = 4 * (4 * atan(1/5) - atan(1/239))
+0002C0  1               ;
+0002C0  1               ; Registers:   A, X, Y
+0002C0  1               ;
+0002C0  1               ; Calls:       matan/atan_mp, masl/asl_mp, msub/sub_mp
+0002C0  1               
+0002C0  1  8D 1A E1 A9  pi:	matan	#mp_a,#5		; a = atan(1/5)
+0002C4  1  80 A0 11 A2  
+0002C8  1  05 20 38 03  
+0002CC  1  8D 1A E2     
+0002CF  1  8D 15 E1 A9  	masl	#mp_a		; a = a * 4
+0002D3  1  80 A0 11 20  
+0002D7  1  E3 04 8D 15  
+0002DB  1  E2           
+0002DC  1  8D 15 E1 A9  	masl	#mp_a
+0002E0  1  80 A0 11 20  
+0002E4  1  E3 04 8D 15  
+0002E8  1  E2           
+0002E9  1  8D 1A E1 A9  	matan	#mp_b,#239	; b = atan(1/239)
+0002ED  1  22 A0 13 A2  
+0002F1  1  EF 20 38 03  
+0002F5  1  8D 1A E2     
+0002F8  1  8D 17 E1 A9  	msub	#mp_a,#mp_b	; a = a - b
+0002FC  1  22 A0 13 85  
+000300  1  02 84 03 A9  
+000304  1  80 A0 11 20  
+000308  1  A5 04 8D 17  
+00030C  1  E2           
+00030D  1  8D 15 E1 A9  	masl	#mp_a		; a = a * 4
+000311  1  80 A0 11 20  
+000315  1  E3 04 8D 15  
+000319  1  E2           
+00031A  1  8D 15 E1 A9  	masl	#mp_a
+00031E  1  80 A0 11 20  
+000322  1  E3 04 8D 15  
+000326  1  E2           
+000327  1  60           	rts
+000328  1               
+000328  1               ; Description: Compute arctan(N) using the Gregory expansion of Machin's
+000328  1               ;              arctan formula and save in array (ptr_a).
+000328  1               ;
+000328  1               ;
+000328  1               ;                            / 1     1      1       \
+000328  1               ;              arctan(N) =  |  - - ---- + ---- - ... |
+000328  1               ;                           |  N      3      5       |
+000328  1               ;                            \     3xN    5xN       /
+000328  1               ;
+000328  1               ;
+000328  1               ; Input:       Y/A (hi/lo) pointer to array
+000328  1               ;              X = N (8 bit)
+000328  1               ;
+000328  1               ; Output:      Y/A (hi/lo) pointer to array = arctan(1/N)
+000328  1               ;
+000328  1               ; Registers:   A, X, Y
+000328  1               ;
+000328  1               ; Calls:       mset/set_mp, mdiv/div_mp, madd/add_mp, msub/sub_mp,
+000328  1               ;              mdiv16/div16_mp, mcopy/copy_mp
+000328  1               ;
+000328  1               ; Globals:     mp_x (16-bit), mp_y (16-bit)
+000328  1               ;
+000328  1               ; C Algorithm:
+000328  1               ;
+000328  1               ; void atanbig(bignum A, unsigned short x)
+000328  1               ; {
+000328  1               ;     bignum X, Y;
+000328  1               ;     unsigned short n = 1;
+000328  1               ;
+000328  1               ;     setbig(X, 1, 0);
+000328  1               ;     divbig(X, x);
+000328  1               ;     copybig(A, X);
+000328  1               ;     x *= x;
+000328  1               ;     while (1) {
+000328  1               ;         n += 2;
+000328  1               ;         divbig(X, x);
+000328  1               ;         copybig(Y, X);
+000328  1               ;         if (!divbig(Y, n))      // dividend = 0
+000328  1               ;             break;
+000328  1               ;         if (n & 2)
+000328  1               ;             subbig(A, Y);
+000328  1               ;         else
+000328  1               ;             addbig(A, Y);
+000328  1               ;     }
+000328  1               ; }
+000328  1               ;
+000328  1               ; Locals (not really):
+000328  1               
+000328  1               regx	=	$E		;  $E-$E    8 bit
+000328  1               x2	=	$F		;  $D-$F    8 bit, x^2 if x < 16
+000328  1               n	=	$10		; $10-$11  16 bit
+000328  1               ptr_a	=	$12		; $12-$13  16 bit
+000328  1               ptr_save=	$14		;     $14   8 bit
+000328  1               
+000328  1               squares:
+000328  1  00 01 04 09  	.byte	0, 1, 4, 9, 16, 25, 36, 49, 64, 81, 100
+00032C  1  10 19 24 31  
+000330  1  40 51 64     
+000333  1  79 90 A9 C4  	.byte	121, 144, 169, 196, 225
+000337  1  E1           
+000338  1               
+000338  1               atan_mp:
+000338  1  85 12        	sta	ptr_a		; store ptr lo from A
+00033A  1  84 13        	sty	ptr_a+1		; store ptr hi from Y
+00033C  1  86 0E        	stx	regx		; save x
+00033E  1               
+00033E  1  A9 00        	lda	#0		; n = 1
+000340  1  85 10        	sta	n
+000342  1  85 11        	sta	n+1
+000344  1  E6 10        	inc	n		; n = 1 little endian
+000346  1               
+000346  1  8D 13 E1 A9  	mset	#mp_x,#1		; mp_x = 1
+00034A  1  C4 A0 14 A2  
+00034E  1  01 20 2C 04  
+000352  1  8D 13 E2     
+000355  1  8D 18 E1 A9  	mdiv	#mp_x,regx	; mp_x /= regx
+000359  1  C4 A0 14 A6  
+00035D  1  0E 20 96 05  
+000361  1  8D 18 E2     
+000364  1  8D 14 E1 A5  	mcopy	ptr_a,#mp_x	; ptr_a = mp_x
+000368  1  12 A4 13 85  
+00036C  1  02 84 03 A9  
+000370  1  C4 A0 14 20  
+000374  1  14 05 8D 14  
+000378  1  E2           
+000379  1               
+000379  1  A6 0E        	ldx	regx		; square x if x < 16
+00037B  1  86 0F        	stx	x2
+00037D  1  E0 10        	cpx	#16
+00037F  1  B0 05        	bcs	atan_mp_loop
+000381  1  BD 28 03     	lda	squares,x	; load from squares table
+000384  1  85 0F        	sta	x2		;   and save
+000386  1               
+000386  1               atan_mp_loop:			; main loop
+000386  1               				; n = n + 2
+000386  1  E6 10        	inc	n		; n now even
+000388  1  D0 02        	bne	:+		; n not zero
+00038A  1  E6 11        	inc	n+1		; n rolled to 0, inc n (hi)
+00038C  1  E6 10        :	inc	n		; n to be odd, save to inc (cannot roll from
+00038E  1               				;   even to odd)
+00038E  1  A6 0E        	ldx	regx		; x = x / regx ^ 2
+000390  1  E0 10        	cpx	#16
+000392  1  90 0F        	bcc	:+		; x already x*x, one div required
+000394  1  8D 18 E1 A9  	mdiv	#mp_x,x2		; x >= 16, then do two div
+000398  1  C4 A0 14 A6  
+00039C  1  0F 20 96 05  
+0003A0  1  8D 18 E2     
+0003A3  1  8D 18 E1 A9  :	mdiv	#mp_x,x2		;   (faster than 16 bit div)
+0003A7  1  C4 A0 14 A6  
+0003AB  1  0F 20 96 05  
+0003AF  1  8D 18 E2     
+0003B2  1               
+0003B2  1  8D 14 E1 A9  	mcopy	#mp_y,#mp_x	; y = x
+0003B6  1  66 A0 16 85  
+0003BA  1  02 84 03 A9  
+0003BE  1  C4 A0 14 20  
+0003C2  1  14 05 8D 14  
+0003C6  1  E2           
+0003C7  1               
+0003C7  1  A6 11        	ldx	n+1		; if n < 256 then div else div16
+0003C9  1  D0 13        	bne	:+		; >= 256 use 16 bit div
+0003CB  1  8D 18 E1 A9  	mdiv	#mp_y,n		; < 256 use 8 bit div
+0003CF  1  66 A0 16 A6  
+0003D3  1  10 20 96 05  
+0003D7  1  8D 18 E2     
+0003DA  1  B0 4F        	bcs	atan_mp_end	; dividend = 0, done
+0003DC  1  90 17        	bcc	:++		; still working on it
+0003DE  1  8D 19 E1 A5  :	mdiv16	#mp_y,n		; div16
+0003E2  1  10 A4 11 84  
+0003E6  1  08 85 09 A9  
+0003EA  1  66 A0 16 20  
+0003EE  1  6E 07 8D 19  
+0003F2  1  E2           
+0003F3  1  B0 36        	bcs	atan_mp_end	; dividend = 0, done
+0003F5  1               
+0003F5  1  A5 10        :	lda	n		; add or sub
+0003F7  1  29 02        	and	#2
+0003F9  1  F0 18        	beq	:+		; add it
+0003FB  1  8D 17 E1 A9  	msub	ptr_a,#mp_y	; a = a - y
+0003FF  1  66 A0 16 85  
+000403  1  02 84 03 A5  
+000407  1  12 A4 13 20  
+00040B  1  A5 04 8D 17  
+00040F  1  E2           
+000410  1  4C 86 03     	jmp	atan_mp_loop
+000413  1  8D 16 E1 A9  :	madd	ptr_a,#mp_y	; a = a + y
+000417  1  66 A0 16 85  
+00041B  1  02 84 03 A5  
+00041F  1  12 A4 13 20  
+000423  1  67 04 8D 16  
+000427  1  E2           
+000428  1  4C 86 03     	jmp	atan_mp_loop
+00042B  1               atan_mp_end:
+00042B  1  60           	rts
+00042C  1               
+00042C  1               
+00042C  1               ; Description: set array initial value
+00042C  1               ;
+00042C  1               ; Input:       Y(hi)/A(lo) pointer to mp
+00042C  1               ;              X = value left of decimal
+00042C  1               ;
+00042C  1               ; Output:      (ptr),0 = X
+00042C  1               ;              (ptr),1 - (ptr),length-1 = 0
+00042C  1               ;
+00042C  1               ; Registers:   A, X, Y
+00042C  1               ;
+00042C  1               ; Globals:     zp length (16-bit), zp ptr (16-bit)
+00042C  1               
+00042C  1               set_mp:
+00042C  1  85 00 84 01  	stay	ptr		; store ptr lo/hi from A/Y
+000430  1  A0 00        	ldy	#0		; left of decimal
+000432  1  8A           	txa			; x holds initial value left of decimal
+000433  1  91 00        	sta	(ptr),y		; store initial value
+000435  1  E6 00        	inc	ptr		; bump up pointer
+000437  1  D0 02        	bne	:+		;  to next digit
+000439  1  E6 01        	inc	ptr+1		;  rest of array will be 0
+00043B  1  A2 01        : 	ldx	#>bin_end	; length of remaining digits to set
+00043D  1  A0 A1        	ldy	#<bin_end
+00043F  1  E8           	inx			; bump up x +1 for the partial page
+000440  1  18           	clc			; adjust to point below source start
+000441  1  98           	tya			; - ex: ptr = $xx00, bin_len = 1
+000442  1  65 00        	adc	ptr		; we want ptr = $(xx-1)01, y = $ff (255)
+000444  1  85 00        	sta	ptr
+000446  1  B0 02        	bcs	:+
+000448  1  C6 01        	dec	ptr+1
+00044A  1  98           :	tya			; adjust y index value, y = -y
+00044B  1  49 FF        	eor	#$ff		; one's complement
+00044D  1  A8           	tay
+00044E  1  C8           	iny			; two's complement
+00044F  1  A9 00        	lda	#0		; A must be set to #0 to clear array
+000451  1  F0 09        	beq	@3		; Duff's Device hard coded
+000453  1  91 00        @0:	sta	(ptr),y		; move even byte (0, 2, ..., 254)
+000455  1  C8           	iny
+000456  1  91 00        @1:	sta	(ptr),y		; move odd byte (1, 3, ..., 255)
+000458  1  C8           	iny			; page done ?
+000459  1  91 00        @2:	sta	(ptr),y		; move even byte (0, 2, ..., 254)
+00045B  1  C8           	iny
+00045C  1  91 00        @3:	sta	(ptr),y		; move odd byte (1, 3, ..., 255)
+00045E  1  C8           	iny			; page done ?
+00045F  1  D0 F2        	bne	@0		; b: no
+000461  1  E6 01        	inc	ptr+1		; next page
+000463  1  CA           	dex			; full page left ?
+000464  1  D0 ED        	bne	@0
+000466  1  60           	rts
+000467  1               
+000467  1               
+000467  1               ; Description: Multiprecision add:  a = a + b
+000467  1               ;
+000467  1               ; Input:       Y/A (hi/lo) pointer to array (a)
+000467  1               ;              ptr_mp set by macro to point to array (b)
+000467  1               ;
+000467  1               ; Output:      a = a + b
+000467  1               ;
+000467  1               ; Registers:   A, X, Y
+000467  1               ;
+000467  1               ; Globals:     zp ptr (16-bit),
+000467  1               ;              zp ptr_mp (16-bit)
+000467  1               
+000467  1               add_mp:
+000467  1  85 00        	sta	ptr		; store ptr lo from A
+000469  1  98           	tya
+00046A  1  18           	clc
+00046B  1  69 01        	adc	#>bin_end	; add number of pages since we have to go
+00046D  1  85 01        	sta	ptr+1		;   backwards for add/sub/asl
+00046F  1  A5 03        	lda	ptr_mp+1
+000471  1  18           	clc
+000472  1  69 01        	adc	#>bin_end	; add number of pages since we have to go
+000474  1  85 03        	sta	ptr_mp+1	;   backwards for add/sub/asl
+000476  1  A2 01        	ldx	#>bin_end	; full pages
+000478  1  A0 A1        	ldy	#<bin_end	; partial
+00047A  1  18           	clc			; clear carry for many adds
+00047B  1               				; Duff's Device
+00047B  1  90 14        	bcc	@1		; bin_len hard coded, no need to guess
+00047D  1  CA           :	dex
+00047E  1  C6 01        	dec	ptr+1		; previous page of 256
+000480  1  C6 03        	dec	ptr_mp+1	; previous page of 256
+000482  1  88           :	dey
+000483  1  B1 00        @3:	lda	(ptr),y		; a	; do bytes 3,4,...,255
+000485  1  71 02        	adc	(ptr_mp),y	; + b
+000487  1  91 00        	sta	(ptr),y		; a = a + b
+000489  1  88           	dey
+00048A  1  B1 00        @2:	lda	(ptr),y		; a	; do bytes 2,4,...,254
+00048C  1  71 02        	adc	(ptr_mp),y	; + b
+00048E  1  91 00        	sta	(ptr),y		; a = a + b
+000490  1  88           	dey
+000491  1  B1 00        @1:	lda	(ptr),y		; a	; do bytes 1,5,...,253
+000493  1  71 02        	adc	(ptr_mp),y	; + b
+000495  1  91 00        	sta	(ptr),y		; a = a + b
+000497  1  88           	dey
+000498  1  B1 00        @0:	lda	(ptr),y		; a	; do bytes 0,4,...,252
+00049A  1  71 02        	adc	(ptr_mp),y	; + b
+00049C  1  91 00        	sta	(ptr),y		; a = a + b
+00049E  1  98           	tya
+00049F  1  D0 E1        	bne	:-
+0004A1  1  8A           	txa
+0004A2  1  D0 D9        	bne	:--
+0004A4  1  60           	rts
+0004A5  1               
+0004A5  1               
+0004A5  1               ; Description: Multiprecision subtract:  a = a - b
+0004A5  1               ;
+0004A5  1               ; Input:       Y/A (hi/lo) pointer to array (a)
+0004A5  1               ;              ptr_mp set by macro to point to array (b)
+0004A5  1               ;
+0004A5  1               ; Output:      a = a - b
+0004A5  1               ;
+0004A5  1               ; Registers:   A, X, Y
+0004A5  1               ;
+0004A5  1               ; Globals:     zp ptr (16-bit),
+0004A5  1               ;              zp ptr_mp (16-bit)
+0004A5  1               
+0004A5  1               sub_mp:
+0004A5  1  85 00        	sta	ptr		; store ptr lo from A
+0004A7  1  98           	tya
+0004A8  1  18           	clc
+0004A9  1  69 01        	adc	#>bin_end	; add number of pages since we have to go
+0004AB  1  85 01        	sta	ptr+1		;   backwards for add/sub/asl
+0004AD  1  A5 03        	lda	ptr_mp+1
+0004AF  1  18           	clc
+0004B0  1  69 01        	adc	#>bin_end	; add number of pages since we have to go
+0004B2  1  85 03        	sta	ptr_mp+1	;   backwards for add/sub/asl
+0004B4  1  A2 01        	ldx	#>bin_end	; full pages
+0004B6  1  A0 A1        	ldy	#<bin_end	; partial
+0004B8  1  38           	sec			; sec carry for many subs
+0004B9  1  B0 14        	bcs	@1		; bin_len hard coded, no need to guess
+0004BB  1  CA           :	dex
+0004BC  1  C6 01        	dec	ptr+1		; previous page of 256
+0004BE  1  C6 03        	dec	ptr_mp+1	; previous page of 256
+0004C0  1  88           :	dey
+0004C1  1  B1 00        @3:	lda	(ptr),y		; a	; do bytes 3,7,...,255
+0004C3  1  F1 02        	sbc	(ptr_mp),y	; - b
+0004C5  1  91 00        	sta	(ptr),y		; a = a - b
+0004C7  1  88           	dey
+0004C8  1  B1 00        @2:	lda	(ptr),y		; a	; do bytes 2,6,...,254
+0004CA  1  F1 02        	sbc	(ptr_mp),y	; - b
+0004CC  1  91 00        	sta	(ptr),y		; a = a - b
+0004CE  1  88           	dey
+0004CF  1  B1 00        @1:	lda	(ptr),y		; a	; do bytes 1,5,...,253
+0004D1  1  F1 02        	sbc	(ptr_mp),y	; - b
+0004D3  1  91 00        	sta	(ptr),y		; a = a - b
+0004D5  1  88           	dey
+0004D6  1  B1 00        @0:	lda	(ptr),y		; a	; do bytes 0,4,...,252
+0004D8  1  F1 02        	sbc	(ptr_mp),y	; - b
+0004DA  1  91 00        	sta	(ptr),y		; a = a - b
+0004DC  1  98           	tya
+0004DD  1  D0 E1        	bne	:-
+0004DF  1  8A           	txa
+0004E0  1  D0 D9        	bne	:--
+0004E2  1  60           	rts
+0004E3  1               
+0004E3  1               
+0004E3  1               ; Description: Multiprecision shift left:  a = a * 2
+0004E3  1               ;
+0004E3  1               ; Input:       Y/A (hi/lo) pointer to array (a)
+0004E3  1               ;
+0004E3  1               ; Output:      a = a * 2
+0004E3  1               ;
+0004E3  1               ; Registers:   A, X, Y
+0004E3  1               ;
+0004E3  1               ; Globals:     zp ptr (16-bit),
+0004E3  1               
+0004E3  1               asl_mp:
+0004E3  1  85 00        	sta	ptr		; store ptr lo from A
+0004E5  1  98           	tya
+0004E6  1  18           	clc
+0004E7  1  69 01        	adc	#>bin_end	; add number of pages since we have to go
+0004E9  1  85 01        	sta	ptr+1		;   backwards for add/sub/asl
+0004EB  1  A2 01        	ldx	#>bin_end	; full pages
+0004ED  1  A0 A1        	ldy	#<bin_end	; partial
+0004EF  1  18           	clc			; clear carry for many rols
+0004F0  1  90 10        	bcc	@1		; bin_len hard coded, no need to guess
+0004F2  1  CA           :	dex
+0004F3  1  C6 01        	dec	ptr+1		; previous page of 256
+0004F5  1  88           :	dey
+0004F6  1  B1 00        @3:	lda	(ptr),y		; do bytes 3,7,...,255
+0004F8  1  2A           	rol
+0004F9  1  91 00        	sta	(ptr),y
+0004FB  1  88           	dey
+0004FC  1  B1 00        @2:	lda	(ptr),y		; do bytes 2,6,...,254
+0004FE  1  2A           	rol
+0004FF  1  91 00        	sta	(ptr),y
+000501  1  88           	dey
+000502  1  B1 00        @1:	lda	(ptr),y		; do bytes 1,5,...,253
+000504  1  2A           	rol
+000505  1  91 00        	sta	(ptr),y
+000507  1  88           	dey
+000508  1  B1 00        @0:	lda	(ptr),y		; do bytes 0,4,...,252
+00050A  1  2A           	rol
+00050B  1  91 00        	sta	(ptr),y
+00050D  1  98           	tya
+00050E  1  D0 E5        	bne	:-
+000510  1  8A           	txa
+000511  1  D0 DF        	bne	:--
+000513  1  60           	rts
+000514  1               
+000514  1               
+000514  1               ; Description: Multiprecision transfer:  a = b
+000514  1               ;
+000514  1               ; Input:       Y/A (hi/lo) pointer to array (b)
+000514  1               ;              ptr_mp set by macro to point to array (a)
+000514  1               ;
+000514  1               ; Output:      a = b
+000514  1               ;
+000514  1               ; Registers:   A, X, Y
+000514  1               ;
+000514  1               ; Globals:     zp ptr (16-bit), zp ptr_mp (16-bit)
+000514  1               
+000514  1               copy_mp:
+000514  1  85 00        	sta	ptr		; store ptr lo from A
+000516  1  84 01        	sty	ptr+1		; store ptr hi from Y
+000518  1  A2 01        	ldx	#>bin_len	; full pages
+00051A  1  A0 A2        	ldy	#<bin_len	; partial pages
+00051C  1  F0 1D        	beq	@0		;   if not process full pages only
+00051E  1  E8           	inx			; bump up x +1 for the partial page
+00051F  1  18           	clc			; adjust to point below source start
+000520  1  98           	tya			; - ex: ptr = $xx00, bin_len = 1
+000521  1  65 00        	adc	ptr		; we want ptr = $(xx-1)01, y = $ff (255)
+000523  1  85 00        	sta	ptr
+000525  1  B0 02        	bcs	:+
+000527  1  C6 01        	dec	ptr+1
+000529  1  18           :	clc			; adjust to point below destination start
+00052A  1  98           	tya			; - ex: ptr_mp = $xxff, bin_len = 2
+00052B  1  65 02        	adc	ptr_mp		; we want ptr_mp = $xx01, y = $fe (254)
+00052D  1  85 02        	sta	ptr_mp
+00052F  1  B0 02        	bcs	:+
+000531  1  C6 03        	dec	ptr_mp+1
+000533  1  98           :	tya			; adjust y index value, y = -y
+000534  1  49 FF        	eor	#$ff		; one's complement
+000536  1  A8           	tay
+000537  1  C8           	iny			; two's complement
+000538  1               				; Duff's Device.
+000538  1  4C 45 05     	jmp	@2		; bin_len hard coded, no need to guess
+00053B  1  B1 00        @0:	lda	(ptr),y		; move bytes 0,4,...,252
+00053D  1  91 02        	sta	(ptr_mp),y
+00053F  1  C8           	iny
+000540  1  B1 00        @1:	lda	(ptr),y		; move bytes 1,5,...,253
+000542  1  91 02        	sta	(ptr_mp),y
+000544  1  C8           	iny
+000545  1  B1 00        @2:	lda	(ptr),y		; move bytes 2,6,...,254
+000547  1  91 02        	sta	(ptr_mp),y
+000549  1  C8           	iny
+00054A  1  B1 00        @3:	lda	(ptr),y		; move bytes 3,7,...,255
+00054C  1  91 02        	sta	(ptr_mp),y
+00054E  1  C8           	iny			; page done ?
+00054F  1  D0 EA        	bne	@0		; b: no
+000551  1  E6 01        	inc	ptr+1		; next page
+000553  1  E6 03        	inc	ptr_mp+1
+000555  1  CA           	dex			; full page left ?
+000556  1  D0 E3        	bne	@0		; b:yes
+000558  1  60           	rts
+000559  1               
+000559  1               
+000559  1               ; Description: Skip leading zeros (used by div_mp and div16_mp)
+000559  1               ;
+000559  1               ; Input:       Y/A (hi/lo) pointer to array (b)
+000559  1               ;
+000559  1               ; Output:      None
+000559  1               ;
+000559  1               ; Registers:   A, X, Y
+000559  1               ;
+000559  1               ; Globals:     zp ptr (16-bit)
+000559  1               
+000559  1               skipzeros:
+000559  1  85 00        	sta	ptr		; store ptr lo from A
+00055B  1  84 01        	sty	ptr+1		; store ptr hi from Y
+00055D  1  A2 01        	ldx	#>bin_len	; full pages
+00055F  1  A0 A2        	ldy	#<bin_len	; partial pages ?
+000561  1  F0 13        	beq	@0		; b:no - process full pages only
+000563  1  E8           	inx			; bump up x +1 for the partial page
+000564  1  18           	clc			; adjust to point below source start
+000565  1  98           	tya			; - ex: ptr = $xx00, bin_len = 1
+000566  1  65 00        	adc	ptr		; we want ptr = $(xx-1)01, y = $ff (255)
+000568  1  85 00        	sta	ptr
+00056A  1  B0 02        	bcs	:+
+00056C  1  C6 01        	dec	ptr+1
+00056E  1  98           :	tya			; adjust y index value, y = -y
+00056F  1  49 FF        	eor	#$ff		; one's complement
+000571  1  A8           	tay
+000572  1  C8           	iny			; two's complement
+000573  1               				; Duff's Device.
+000573  1  4C 80 05     	jmp	@2		; bin_len hard coded, no need to guess
+000576  1  B1 00        @0:	lda	(ptr),y		; check	0,4,...,252
+000578  1  D0 1A        	bne	@5
+00057A  1  C8           	iny
+00057B  1  B1 00        @1:	lda	(ptr),y		; check 1,5,...,253
+00057D  1  D0 14        	bne	@4
+00057F  1  C8           	iny
+000580  1  B1 00        @2:	lda	(ptr),y		; check 2,6,...,254
+000582  1  D0 10        	bne	@5
+000584  1  C8           	iny
+000585  1  B1 00        @3:	lda	(ptr),y		; check 3,7,...,255
+000587  1  D0 0A        	bne	@4
+000589  1  C8           	iny
+00058A  1  D0 EA        	bne	@0
+00058C  1  E6 01        	inc	ptr+1		; next page
+00058E  1  CA           	dex			; is there another page ?
+00058F  1  D0 E5        	bne	@0		; b:yes
+000591  1  38           	sec			; flag: all cells are zero
+000592  1  60           	rts
+000593  1  88           @4:	dey			; make Y even
+000594  1  18           @5:	clc			; flag: (ptr),y -> first non-zero cell
+000595  1  60           	rts
+000596  1               
+000596  1               
+000596  1               ; Description: 16-bit/8-bit divide based on:
+000596  1               ;              http://6502org.wikidot.com/software-math-intdiv
+000596  1               ;
+000596  1               ; Input:       divisor (8-bit), dividend (16-bit) hi: X, lo: dividend
+000596  1               ;
+000596  1               ; Output:      divisor (8-bit) unchanged,
+000596  1               ;              X: remainder (8-bit),
+000596  1               ;              dividend (8-bit): quotient
+000596  1               ;
+000596  1               ; Registers:   A, X
+000596  1               
+000596  1               .macro	div8
+000596  1               	txa			; remainder
+000596  1               	asl	dividend
+000596  1               	.repeat 8		; unroll 8 times for speed
+000596  1               	rol
+000596  1               	bcs	:+
+000596  1               	cmp	divisor
+000596  1               	bcc	:++
+000596  1               :	sbc	divisor
+000596  1               	sec
+000596  1               :	rol	dividend
+000596  1               	.endrepeat
+000596  1               	tax			; remainder
+000596  1               .endmacro
+000596  1               
+000596  1               
+000596  1               ; Description: Divide mp array by 8-bit number.
+000596  1               ;
+000596  1               ; Input:       Y(hi)/A(lo) pointer to mp
+000596  1               ;              X = dividend/denominator
+000596  1               ;
+000596  1               ; Output:      (ptr) = (ptr)/x
+000596  1               ;
+000596  1               ; Registers:   A, X, Y
+000596  1               ;
+000596  1               ; Globals:     zp ptr (16-bit), dividend (8-bit),
+000596  1               ;              zp xreg (8-bit),
+000596  1               ;
+000596  1               ; Calls:       skipzeros, div8(macro)
+000596  1               ;
+000596  1               ; C Algorithm:
+000596  1               ;
+000596  1               ; short divbig(number, x)
+000596  1               ; bignum number;
+000596  1               ; unsigned short x;
+000596  1               ; {
+000596  1               ;     dword result;
+000596  1               ;     short j = 0;
+000596  1               ;     unsigned short rest = 0;
+000596  1               ;
+000596  1               ;     while (number[j] == 0 && j < MAXSIZE)
+000596  1               ;         j++;
+000596  1               ;     if (j == MAXSIZE)
+000596  1               ;         return (0);
+000596  1               ;     while (j < MAXSIZE) {
+000596  1               ;         result.w.lo = number[j];
+000596  1               ;         result.w.hi = rest;
+000596  1               ;         number[j] = result.L / x;
+000596  1               ;         rest = result.L % x;
+000596  1               ;         j++;
+000596  1               ;     }
+000596  1               ;     return (1);
+000596  1               ; }
+000596  1               
+000596  1               div_mp:
+000596  1  86 08        	stx	divisor		; save divisor
+000598  1  20 59 05     	jsr	skipzeros	; skip leading zeros for speed
+00059B  1  90 01        	bcc	:+		; carry clear?  continue
+00059D  1  60           	rts			;   else all zeros, return to caller
+00059E  1  86 0B        :	stx	xreg		; need x reg for speed (carry)
+0005A0  1  A2 00        	ldx	#0
+0005A2  1  98           	tya
+0005A3  1  29 02        	and	#%10		; Duff's device.  Check for odd or even number
+0005A5  1  F0 03        	beq	@0		; of pairs
+0005A7  1  4C 84 06     	jmp	@2
+0005AA  1  B1 00        @0:	lda	(ptr),y		; div byte 0,4,...,252
+0005AC  1  85 04        	sta	dividend
+0005AE  1  8A 06 04 2A  	div8
+0005B2  1  B0 04 C5 08  
+0005B6  1  90 03 E5 08  
+0005BA  1  38 26 04 2A  
+0005BE  1  B0 04 C5 08  
+0005C2  1  90 03 E5 08  
+0005C6  1  38 26 04 2A  
+0005CA  1  B0 04 C5 08  
+0005CE  1  90 03 E5 08  
+0005D2  1  38 26 04 2A  
+0005D6  1  B0 04 C5 08  
+0005DA  1  90 03 E5 08  
+0005DE  1  38 26 04 2A  
+0005E2  1  B0 04 C5 08  
+0005E6  1  90 03 E5 08  
+0005EA  1  38 26 04 2A  
+0005EE  1  B0 04 C5 08  
+0005F2  1  90 03 E5 08  
+0005F6  1  38 26 04 2A  
+0005FA  1  B0 04 C5 08  
+0005FE  1  90 03 E5 08  
+000602  1  38 26 04 2A  
+000606  1  B0 04 C5 08  
+00060A  1  90 03 E5 08  
+00060E  1  38 26 04 AA  
+000612  1  A5 04        	lda	dividend
+000614  1  91 00        	sta	(ptr),y
+000616  1  C8           	iny
+000617  1  B1 00        @1:	lda	(ptr),y		; div byte 1,5,...,253
+000619  1  85 04        	sta	dividend
+00061B  1  8A 06 04 2A  	div8
+00061F  1  B0 04 C5 08  
+000623  1  90 03 E5 08  
+000627  1  38 26 04 2A  
+00062B  1  B0 04 C5 08  
+00062F  1  90 03 E5 08  
+000633  1  38 26 04 2A  
+000637  1  B0 04 C5 08  
+00063B  1  90 03 E5 08  
+00063F  1  38 26 04 2A  
+000643  1  B0 04 C5 08  
+000647  1  90 03 E5 08  
+00064B  1  38 26 04 2A  
+00064F  1  B0 04 C5 08  
+000653  1  90 03 E5 08  
+000657  1  38 26 04 2A  
+00065B  1  B0 04 C5 08  
+00065F  1  90 03 E5 08  
+000663  1  38 26 04 2A  
+000667  1  B0 04 C5 08  
+00066B  1  90 03 E5 08  
+00066F  1  38 26 04 2A  
+000673  1  B0 04 C5 08  
+000677  1  90 03 E5 08  
+00067B  1  38 26 04 AA  
+00067F  1  A5 04        	lda	dividend
+000681  1  91 00        	sta	(ptr),y
+000683  1  C8           	iny
+000684  1  B1 00        @2:	lda	(ptr),y		; div byte 2,6,...,254
+000686  1  85 04        	sta	dividend
+000688  1  8A 06 04 2A  	div8
+00068C  1  B0 04 C5 08  
+000690  1  90 03 E5 08  
+000694  1  38 26 04 2A  
+000698  1  B0 04 C5 08  
+00069C  1  90 03 E5 08  
+0006A0  1  38 26 04 2A  
+0006A4  1  B0 04 C5 08  
+0006A8  1  90 03 E5 08  
+0006AC  1  38 26 04 2A  
+0006B0  1  B0 04 C5 08  
+0006B4  1  90 03 E5 08  
+0006B8  1  38 26 04 2A  
+0006BC  1  B0 04 C5 08  
+0006C0  1  90 03 E5 08  
+0006C4  1  38 26 04 2A  
+0006C8  1  B0 04 C5 08  
+0006CC  1  90 03 E5 08  
+0006D0  1  38 26 04 2A  
+0006D4  1  B0 04 C5 08  
+0006D8  1  90 03 E5 08  
+0006DC  1  38 26 04 2A  
+0006E0  1  B0 04 C5 08  
+0006E4  1  90 03 E5 08  
+0006E8  1  38 26 04 AA  
+0006EC  1  A5 04        	lda	dividend
+0006EE  1  91 00        	sta	(ptr),y
+0006F0  1  C8           	iny
+0006F1  1  B1 00        @3:	lda	(ptr),y		; div byte 3,7,...,255
+0006F3  1  85 04        	sta	dividend
+0006F5  1  8A 06 04 2A  	div8
+0006F9  1  B0 04 C5 08  
+0006FD  1  90 03 E5 08  
+000701  1  38 26 04 2A  
+000705  1  B0 04 C5 08  
+000709  1  90 03 E5 08  
+00070D  1  38 26 04 2A  
+000711  1  B0 04 C5 08  
+000715  1  90 03 E5 08  
+000719  1  38 26 04 2A  
+00071D  1  B0 04 C5 08  
+000721  1  90 03 E5 08  
+000725  1  38 26 04 2A  
+000729  1  B0 04 C5 08  
+00072D  1  90 03 E5 08  
+000731  1  38 26 04 2A  
+000735  1  B0 04 C5 08  
+000739  1  90 03 E5 08  
+00073D  1  38 26 04 2A  
+000741  1  B0 04 C5 08  
+000745  1  90 03 E5 08  
+000749  1  38 26 04 2A  
+00074D  1  B0 04 C5 08  
+000751  1  90 03 E5 08  
+000755  1  38 26 04 AA  
+000759  1  A5 04        	lda	dividend
+00075B  1  91 00        	sta	(ptr),y
+00075D  1  C8           	iny			; page done ?
+00075E  1  F0 03        	beq	:+
+000760  1  4C AA 05     	jmp	@0
+000763  1  C6 0B        :	dec	xreg		; full page left ?
+000765  1  F0 05        	beq	:+
+000767  1  E6 01        	inc	ptr+1		; next page
+000769  1  4C AA 05     	jmp	@0
+00076C  1  18           :	clc			; non zero result
+00076D  1  60           	rts
+00076E  1               
+00076E  1               
+00076E  1               ; Description: 32-bit/16-bit divide based on:
+00076E  1               ;              Apple II firmware (Steve Wozniak) and
+00076E  1               ;              http://www.txbobsc.com/aal/1983/aal8303.html#a5, and
+00076E  1               ;              optimized by Anton Treuenfels.
+00076E  1               ;
+00076E  1               ; Input:       divisor (16-bit big endian), dividend (32-bit big endian)
+00076E  1               ;
+00076E  1               ; Output:      divisor (16-bit big endian) unchanged,
+00076E  1               ;              dividend (32-bit big endian) hi: remainder
+00076E  1               ;              dividend (32-bit big endian) lo: quotient
+00076E  1               ;
+00076E  1               ; Registers:   A, X, Y
+00076E  1               
+00076E  1               .macro	div16
+00076E  1               	ldx	dividend+1	; remainder
+00076E  1               	ldy	dividend+0	; remainder
+00076E  1               	.repeat 16		; unroll 16 times for speed
+00076E  1               	asl	dividend+3	; 5
+00076E  1               	rol	dividend+2	; 10
+00076E  1               	txa			; 12
+00076E  1               	rol			; 14
+00076E  1               	tax			; 16
+00076E  1               	tya			; 18
+00076E  1               	rol			; 20
+00076E  1               	tay			; 22
+00076E  1               	cpx	divisor+1	; 25
+00076E  1               	sbc	divisor+0	; 28
+00076E  1               	bcc	:+		; 30/31 (no subtraction)
+00076E  1               	tay			; 32
+00076E  1               	txa			; 34
+00076E  1               	sbc	divisor+1	; 37
+00076E  1               	tax			; 39
+00076E  1               	inc	dividend+3	; 44 (subtraction)
+00076E  1               :
+00076E  1               	.endrepeat
+00076E  1               	stx	dividend+1	; remainder
+00076E  1               	sty	dividend+0	; remainder
+00076E  1               .endmacro
+00076E  1               
+00076E  1               
+00076E  1               ; Description: Divide mp array by 16-bit number.
+00076E  1               ;
+00076E  1               ; Input:       Y(hi)/A(lo) pointer to mp
+00076E  1               ;              divisor (16-bit) set by macro
+00076E  1               ;
+00076E  1               ; Output:      (ptr) = (ptr)/divisor
+00076E  1               ;
+00076E  1               ; Registers:   A, X, Y
+00076E  1               ;
+00076E  1               ; Globals:     zp ptr (16-bit), dividend (32-bit),
+00076E  1               ;              zp xreg (8-bit), divisor (16-bit)
+00076E  1               ;
+00076E  1               ; Calls:       skipzeros, div16(macro), div16_long(macro)
+00076E  1               ;
+00076E  1               ; C Algorithm: see div_mp
+00076E  1               
+00076E  1               .macro	div16_long
+00076E  1               	lda	(ptr),y		; load/store LSB of dividend
+00076E  1               	sta	dividend+2
+00076E  1               	sty	yreg		; save y for updating array
+00076E  1               	iny
+00076E  1               	lda	(ptr),y		; load/store LSB-1 of dividend
+00076E  1               	sta	dividend+3
+00076E  1               	div16			; need x and y reg
+00076E  1               	ldy	yreg		; restore y
+00076E  1               	lda	quotient+0	; load/store quotient MSB to array
+00076E  1               	sta	(ptr),y
+00076E  1               	iny
+00076E  1               	lda	quotient+1	; load/store quotient LSB to array
+00076E  1               	sta	(ptr),y
+00076E  1               	iny
+00076E  1               .endmacro
+00076E  1               
+00076E  1               div16_mp:
+00076E  1  20 59 05     	jsr	skipzeros	; skip leading zeros for speed
+000771  1  90 01        	bcc	:+		; carry clear?  continue
+000773  1  60           	rts			;   else all zeros, return to caller
+000774  1  A9 00        :	lda	#0		; clear remainder/carry
+000776  1  85 04        	sta	dividend+0	; MSB (big endian)
+000778  1  85 05        	sta	dividend+1	; MSB-1
+00077A  1  86 0B        	stx	xreg		; macro div16 needs x reg
+00077C  1  98           	tya
+00077D  1  4A           	lsr			; even number of non-zero
+00077E  1  29 03        	and	#%11		; however there can be an odd number of pairs
+000780  1  F0 0E        	beq	@0		; 00 & 11 = 0
+000782  1  4A           	lsr			; 00 => 0,0; 01 => 0,1; 10 => 1,0; 11 => 1,1
+000783  1  D0 03        	bne	:+
+000785  1  4C 1F 09     	jmp	@1		; 0,1 long branch
+000788  1  90 03        :	bcc	:+		; 1,0 long branch
+00078A  1  4C 3D 0C     	jmp	@3		; 1,1 long branch
+00078D  1  4C AE 0A     :	jmp	@2
+000790  1  B1 00 85 06  @0:	div16_long
+000794  1  84 0A C8 B1  
+000798  1  00 85 07 A6  
+00079C  1  05 A4 04 06  
+0007A0  1  07 26 06 8A  
+0007A4  1  2A AA 98 2A  
+0007A8  1  A8 E4 09 E5  
+0007AC  1  08 90 07 A8  
+0007B0  1  8A E5 09 AA  
+0007B4  1  E6 07 06 07  
+0007B8  1  26 06 8A 2A  
+0007BC  1  AA 98 2A A8  
+0007C0  1  E4 09 E5 08  
+0007C4  1  90 07 A8 8A  
+0007C8  1  E5 09 AA E6  
+0007CC  1  07 06 07 26  
+0007D0  1  06 8A 2A AA  
+0007D4  1  98 2A A8 E4  
+0007D8  1  09 E5 08 90  
+0007DC  1  07 A8 8A E5  
+0007E0  1  09 AA E6 07  
+0007E4  1  06 07 26 06  
+0007E8  1  8A 2A AA 98  
+0007EC  1  2A A8 E4 09  
+0007F0  1  E5 08 90 07  
+00091F  1  B1 00 85 06  @1:	div16_long
+000923  1  84 0A C8 B1  
+000927  1  00 85 07 A6  
+00092B  1  05 A4 04 06  
+00092F  1  07 26 06 8A  
+000933  1  2A AA 98 2A  
+000937  1  A8 E4 09 E5  
+00093B  1  08 90 07 A8  
+00093F  1  8A E5 09 AA  
+000943  1  E6 07 06 07  
+000947  1  26 06 8A 2A  
+00094B  1  AA 98 2A A8  
+00094F  1  E4 09 E5 08  
+000953  1  90 07 A8 8A  
+000957  1  E5 09 AA E6  
+00095B  1  07 06 07 26  
+00095F  1  06 8A 2A AA  
+000963  1  98 2A A8 E4  
+000967  1  09 E5 08 90  
+00096B  1  07 A8 8A E5  
+00096F  1  09 AA E6 07  
+000973  1  06 07 26 06  
+000977  1  8A 2A AA 98  
+00097B  1  2A A8 E4 09  
+00097F  1  E5 08 90 07  
+000AAE  1  B1 00 85 06  @2:	div16_long
+000AB2  1  84 0A C8 B1  
+000AB6  1  00 85 07 A6  
+000ABA  1  05 A4 04 06  
+000ABE  1  07 26 06 8A  
+000AC2  1  2A AA 98 2A  
+000AC6  1  A8 E4 09 E5  
+000ACA  1  08 90 07 A8  
+000ACE  1  8A E5 09 AA  
+000AD2  1  E6 07 06 07  
+000AD6  1  26 06 8A 2A  
+000ADA  1  AA 98 2A A8  
+000ADE  1  E4 09 E5 08  
+000AE2  1  90 07 A8 8A  
+000AE6  1  E5 09 AA E6  
+000AEA  1  07 06 07 26  
+000AEE  1  06 8A 2A AA  
+000AF2  1  98 2A A8 E4  
+000AF6  1  09 E5 08 90  
+000AFA  1  07 A8 8A E5  
+000AFE  1  09 AA E6 07  
+000B02  1  06 07 26 06  
+000B06  1  8A 2A AA 98  
+000B0A  1  2A A8 E4 09  
+000B0E  1  E5 08 90 07  
+000C3D  1  B1 00 85 06  @3:	div16_long
+000C41  1  84 0A C8 B1  
+000C45  1  00 85 07 A6  
+000C49  1  05 A4 04 06  
+000C4D  1  07 26 06 8A  
+000C51  1  2A AA 98 2A  
+000C55  1  A8 E4 09 E5  
+000C59  1  08 90 07 A8  
+000C5D  1  8A E5 09 AA  
+000C61  1  E6 07 06 07  
+000C65  1  26 06 8A 2A  
+000C69  1  AA 98 2A A8  
+000C6D  1  E4 09 E5 08  
+000C71  1  90 07 A8 8A  
+000C75  1  E5 09 AA E6  
+000C79  1  07 06 07 26  
+000C7D  1  06 8A 2A AA  
+000C81  1  98 2A A8 E4  
+000C85  1  09 E5 08 90  
+000C89  1  07 A8 8A E5  
+000C8D  1  09 AA E6 07  
+000C91  1  06 07 26 06  
+000C95  1  8A 2A AA 98  
+000C99  1  2A A8 E4 09  
+000C9D  1  E5 08 90 07  
+000DCC  1  F0 03        	beq	:+		; done?
+000DCE  1  4C 90 07     	jmp	@0
+000DD1  1  C6 0B        :	dec	xreg
+000DD3  1  F0 05        	beq	:+
+000DD5  1  E6 01        	inc	ptr+1		; next page
+000DD7  1  4C 90 07     	jmp	@0
+000DDA  1  18           :	clc			; non zero result
+000DDB  1  60           	rts
+000DDC  1               
+000DDC  1               
+000DDC  1               ; Description: print mp base 10/100
+000DDC  1               ;
+000DDC  1               ; Input:       Y(hi)/A(lo) pointer to array
+000DDC  1               ;
+000DDC  1               ; Output:      mp base 10/100 out to screen
+000DDC  1               ;
+000DDC  1               ; Registers:   A, X, Y, input array
+000DDC  1               ;
+000DDC  1               ; Globals:     zero page: ptr (16-bit) , ptr_mp (16-bit), carry_mp (8-bit)
+000DDC  1               ;
+000DDC  1               ; Locals:
+000DDC  1               
+000DDC  1               print_mp:
+000DDC  1  85 00        	sta	ptr		; store ptr lo from A
+000DDE  1  84 01        	sty	ptr+1		; store ptr hi from Y
+000DE0  1  98           	tya
+000DE1  1  18           	clc
+000DE2  1  69 01        	adc	#>bin_end	; add number of pages since we have to go
+000DE4  1  85 14        	sta	ptr_save	;   backwards for multiply
+000DE6  1               
+000DE6  1  A9 F4        	lda	#<bcd_len
+000DE8  1  85 0C        	sta	dlength
+000DEA  1  A9 01        	lda	#>bcd_len
+000DEC  1  85 0D        	sta	dlength+1
+000DEE  1               
+000DEE  1               				; print left of decimal
+000DEE  1  A0 00        	ldy	#0		; get first digit in array (big endian)
+000DF0  1  B1 00        	lda	(ptr),y
+000DF2  1  AA           	tax
+000DF3  1  BD AE 0E     	lda	bintobcd,x	; table lookup
+000DF6  1  C9 0A        	cmp	#10		; if less than 10 skip leading zero
+000DF8  1  90 06        	bcc	:+
+000DFA  1  20 DC FF     	jsr	prbyte		; print it, only A gets hosed, safe to call
+000DFD  1  4C 06 0E     	jmp	period
+000E00  1  18           :	clc			; no leading zero code
+000E01  1  69 B0        	adc	#$B0		;   convert single digit to ascii
+000E03  1  20 EF FF     	jsr	cout		;   print it
+000E06  1  A9 AE        period:	lda	#'.'+$80	; print decimal point (fixed point math)
+000E08  1  20 EF FF     	jsr	cout		;   print it
+000E0B  1               
+000E0B  1               print_mp1:			; loop through rest of decimal digits
+000E0B  1  A0 00        	ldy	#0		; array[0] = 0
+000E0D  1  A9 00        	lda	#0
+000E0F  1  91 00        	sta	(ptr),y
+000E11  1  85 04        	sta	carry_mp	; clear multiprecision carry
+000E13  1               
+000E13  1  A5 00        	lda	ptr		; ptr_mp to get hosed, must be restored
+000E15  1  85 02        	sta	ptr_mp
+000E17  1  A5 14        	lda	ptr_save	; add number of pages since we have to go
+000E19  1  85 03        	sta	ptr_mp+1	;   backwards for multiply (right -> left)
+000E1B  1               
+000E1B  1               	; multi array x 100
+000E1B  1               	; loop from LSB to MSB
+000E1B  1               	; 16-bit product = array[i] * 100 + carry_mp;
+000E1B  1               	; array[i] = product lo
+000E1B  1               	; carry_mp = product hi
+000E1B  1               	;
+000E1B  1               	; C Algorithm:
+000E1B  1               	;
+000E1B  1               	;    while (j >= 0) {
+000E1B  1                       ;	result.L = (long) number[j] * 100 + carry;
+000E1B  1                       ;	number[j] = result.w.lo;
+000E1B  1                       ;	carry = result.w.hi;
+000E1B  1                       ;	j--;
+000E1B  1                   	;    }
+000E1B  1               
+000E1B  1               	.macro	mult100
+000E1B  1               	lda	(ptr_mp),y	; get it
+000E1B  1               	tax
+000E1B  1               	lda	mult100_lo,x	; get product lo
+000E1B  1               	clc
+000E1B  1               	adc	carry_mp	; add carry_mp to it
+000E1B  1               	sta	(ptr_mp),y	;   and save it
+000E1B  1               	lda	mult100_hi,x	; get product hi
+000E1B  1               	adc	#0		;   add carry if present
+000E1B  1               	sta	carry_mp	;   and save it
+000E1B  1               	.endmacro
+000E1B  1               
+000E1B  1  A2 01        	ldx	#>bin_end	; full pages
+000E1D  1  86 0B        	stx	xreg
+000E1F  1  A0 A1        	ldy	#<bin_end	; partial
+000E21  1               
+000E21  1               
+000E21  1               ;;;; skip trailing zeros
+000E21  1               
+000E21  1               
+000E21  1               ;	jmp	@10
+000E21  1               ;:	dec	xreg
+000E21  1               ;	dec	ptr_mp+1
+000E21  1               ;:	dey
+000E21  1               ;@30:
+000E21  1               ;	lda	(ptr_mp),y	; get it
+000E21  1               ;	bne	@3
+000E21  1               ;	dey
+000E21  1               ;@20:
+000E21  1               ;	lda	(ptr_mp),y	; get it
+000E21  1               ;	bne	@2
+000E21  1               ;	dey
+000E21  1               ;@10:
+000E21  1               ;	lda	(ptr_mp),y	; get it
+000E21  1               ;	bne	@1
+000E21  1               ;	dey
+000E21  1               ;@00:
+000E21  1               ;	lda	(ptr_mp),y	; get it
+000E21  1               ;	bne	@0
+000E21  1               ;	tya
+000E21  1               ;	bne	:-
+000E21  1               ;	ldx	xreg
+000E21  1               ;	bne	:--
+000E21  1               
+000E21  1               
+000E21  1               
+000E21  1               				; Duff's Device.   We know that bin_len is
+000E21  1               				;   even (#<bin_end odd), so just need to
+000E21  1  4C 4F 0E     	jmp	@1		;   check for 2nd bit (odd or even # of pairs).
+000E24  1  C6 0B        :	dec	xreg
+000E26  1  C6 03        	dec	ptr_mp+1	; previous page of 256
+000E28  1  88           :	dey
+000E29  1  B1 02 AA BD  @3:	mult100
+000E2D  1  80 0F 18 65  
+000E31  1  04 91 02 BD  
+000E35  1  80 10 69 00  
+000E39  1  85 04        
+000E3B  1  88           	dey
+000E3C  1  B1 02 AA BD  @2:	mult100
+000E40  1  80 0F 18 65  
+000E44  1  04 91 02 BD  
+000E48  1  80 10 69 00  
+000E4C  1  85 04        
+000E4E  1  88           	dey
+000E4F  1  B1 02 AA BD  @1:	mult100
+000E53  1  80 0F 18 65  
+000E57  1  04 91 02 BD  
+000E5B  1  80 10 69 00  
+000E5F  1  85 04        
+000E61  1  88           	dey
+000E62  1  B1 02 AA BD  @0:	mult100
+000E66  1  80 0F 18 65  
+000E6A  1  04 91 02 BD  
+000E6E  1  80 10 69 00  
+000E72  1  85 04        
+000E74  1  98           	tya
+000E75  1  D0 B1        	bne	:-
+000E77  1  A6 0B        	ldx	xreg
+000E79  1  D0 A9        	bne	:--
+000E7B  1               
+000E7B  1               
+000E7B  1               				; print array[0] (MSB)
+000E7B  1  B1 00        	lda	(ptr),y
+000E7D  1  AA           	tax
+000E7E  1  BD AE 0E     	lda	bintobcd,x	; table lookup
+000E81  1  20 DC FF     	jsr	prbyte		; print it, only A gets hosed, safe to call
+000E84  1               
+000E84  1               				; dlength = dlength - 1
+000E84  1  A5 0C        	lda	dlength		; check if dlength = 0
+000E86  1  D0 02        	bne	:+		;   if so, it will roll to $FF
+000E88  1  C6 0D        	dec	dlength+1	;     so dec dlength+1
+000E8A  1  C6 0C        :	dec	dlength		; dec dlength
+000E8C  1  D0 05        	bne	:+		; check dlength and dlength+1 for zeros
+000E8E  1  A5 0D        	lda	dlength+1	;
+000E90  1  D0 01        	bne	:+
+000E92  1  60           	rts			; dlength = 0, all done
+000E93  1  4C 0B 0E     :	jmp	print_mp1	;
+000E96  1               
+000E96  1               
+000E96  1               ; Description: Print a string.
+000E96  1               ;
+000E96  1               ; Input:       Y(hi)/A(lo) pointer to string
+000E96  1               ;
+000E96  1               ; Output:      String to screen
+000E96  1               ;
+000E96  1               ; Registers:   A, Y, X, ptr
+000E96  1               ;
+000E96  1               ; Globals:     zp ptr (16-bit)
+000E96  1               
+000E96  1  85 00 84 01  print:	stay	ptr		; load Y/A (hi/lo) in ptr
+000E9A  1  A0 00        	ldy	#0		; start with first char
+000E9C  1  B1 00        	lda	(ptr),y		; load initial char
+000E9E  1  09 80        :	ora	#$80		; we do not want flashing or inverse
+000EA0  1               				;  (its an Apple II thing)
+000EA0  1  20 EF FF     	jsr     cout		; call apple II char out
+000EA3  1  C8           	iny			; y++
+000EA4  1  B1 00        	lda	(ptr),y		; get next char
+000EA6  1  D0 F6        	bne	:-		; not NULL? then print it
+000EA8  1  60           	rts			; all done, move alone
+000EA9  1               
+000EA9  1               
+000EA9  1  A9 8D        crout:	lda	#$8D
+000EAB  1  4C EF FF     	jmp	cout
+000EAE  1               
+000EAE  1               
+000EAE  1               bintobcd:
+000EAE  1  00 01 02 03  	.byte	$00,$01,$02,$03,$04,$05,$06,$07,$08,$09
+000EB2  1  04 05 06 07  
+000EB6  1  08 09        
+000EB8  1  10 11 12 13  	.byte	$10,$11,$12,$13,$14,$15,$16,$17,$18,$19
+000EBC  1  14 15 16 17  
+000EC0  1  18 19        
+000EC2  1  20 21 22 23  	.byte	$20,$21,$22,$23,$24,$25,$26,$27,$28,$29
+000EC6  1  24 25 26 27  
+000ECA  1  28 29        
+000ECC  1  30 31 32 33  	.byte	$30,$31,$32,$33,$34,$35,$36,$37,$38,$39
+000ED0  1  34 35 36 37  
+000ED4  1  38 39        
+000ED6  1  40 41 42 43  	.byte	$40,$41,$42,$43,$44,$45,$46,$47,$48,$49
+000EDA  1  44 45 46 47  
+000EDE  1  48 49        
+000EE0  1  50 51 52 53  	.byte	$50,$51,$52,$53,$54,$55,$56,$57,$58,$59
+000EE4  1  54 55 56 57  
+000EE8  1  58 59        
+000EEA  1  60 61 62 63  	.byte	$60,$61,$62,$63,$64,$65,$66,$67,$68,$69
+000EEE  1  64 65 66 67  
+000EF2  1  68 69        
+000EF4  1  70 71 72 73  	.byte	$70,$71,$72,$73,$74,$75,$76,$77,$78,$79
+000EF8  1  74 75 76 77  
+000EFC  1  78 79        
+000EFE  1  80 81 82 83  	.byte	$80,$81,$82,$83,$84,$85,$86,$87,$88,$89
+000F02  1  84 85 86 87  
+000F06  1  88 89        
+000F08  1  90 91 92 93  	.byte	$90,$91,$92,$93,$94,$95,$96,$97,$98,$99
+000F0C  1  94 95 96 97  
+000F10  1  98 99        
+000F12  1               
+000F12  1               
+000F12  1               ; Description: 16-bit table of 0-255 * 100 broken down into multi100_lo and
+000F12  1               ;              multi100_hi.  Used by print_mp
+000F12  1               
+000F12  1               	.linecont +
+000F12  1               	.define	timestable \
+000F12  1               		00000,00100,00200,00300,00400,00500,00600,00700,\
+000F12  1               		00800,00900,01000,01100,01200,01300,01400,01500,\
+000F12  1               		01600,01700,01800,01900,02000,02100,02200,02300,\
+000F12  1               		02400,02500,02600,02700,02800,02900,03000,03100,\
+000F12  1               		03200,03300,03400,03500,03600,03700,03800,03900,\
+000F12  1               		04000,04100,04200,04300,04400,04500,04600,04700,\
+000F12  1               		04800,04900,05000,05100,05200,05300,05400,05500,\
+000F12  1               		05600,05700,05800,05900,06000,06100,06200,06300,\
+000F12  1               		06400,06500,06600,06700,06800,06900,07000,07100,\
+000F12  1               		07200,07300,07400,07500,07600,07700,07800,07900,\
+000F12  1               		08000,08100,08200,08300,08400,08500,08600,08700,\
+000F12  1               		08800,08900,09000,09100,09200,09300,09400,09500,\
+000F12  1               		09600,09700,09800,09900,10000,10100,10200,10300,\
+000F12  1               		10400,10500,10600,10700,10800,10900,11000,11100,\
+000F12  1               		11200,11300,11400,11500,11600,11700,11800,11900,\
+000F12  1               		12000,12100,12200,12300,12400,12500,12600,12700,\
+000F12  1               		12800,12900,13000,13100,13200,13300,13400,13500,\
+000F12  1               		13600,13700,13800,13900,14000,14100,14200,14300,\
+000F12  1               		14400,14500,14600,14700,14800,14900,15000,15100,\
+000F12  1               		15200,15300,15400,15500,15600,15700,15800,15900,\
+000F12  1               		16000,16100,16200,16300,16400,16500,16600,16700,\
+000F12  1               		16800,16900,17000,17100,17200,17300,17400,17500,\
+000F12  1               		17600,17700,17800,17900,18000,18100,18200,18300,\
+000F12  1               		18400,18500,18600,18700,18800,18900,19000,19100,\
+000F12  1               		19200,19300,19400,19500,19600,19700,19800,19900,\
+000F12  1               		20000,20100,20200,20300,20400,20500,20600,20700,\
+000F12  1               		20800,20900,21000,21100,21200,21300,21400,21500,\
+000F12  1               		21600,21700,21800,21900,22000,22100,22200,22300,\
+000F12  1               		22400,22500,22600,22700,22800,22900,23000,23100,\
+000F12  1               		23200,23300,23400,23500,23600,23700,23800,23900,\
+000F12  1               		24000,24100,24200,24300,24400,24500,24600,24700,\
+000F12  1               		24800,24900,25000,25100,25200,25300,25400,25500
+000F12  1               
+000F12  1  xx xx xx xx  	.align	256		; speed bump (~.35 sec for 1000 digits)
+000F16  1  xx xx xx xx  
+000F1A  1  xx xx xx xx  
+000F1E  1  xx xx xx xx  
+000F22  1  xx xx xx xx  
+000F26  1  xx xx xx xx  
+000F2A  1  xx xx xx xx  
+000F2E  1  xx xx xx xx  
+000F32  1  xx xx xx xx  
+000F36  1  xx xx xx xx  
+000F3A  1  xx xx xx xx  
+000F3E  1  xx xx xx xx  
+000F42  1  xx xx xx xx  
+000F46  1  xx xx xx xx  
+000F4A  1  xx xx xx xx  
+000F4E  1  xx xx xx xx  
+000F52  1  xx xx xx xx  
+000F56  1  xx xx xx xx  
+000F5A  1  xx xx xx xx  
+000F5E  1  xx xx xx xx  
+000F62  1  xx xx xx xx  
+000F66  1  xx xx xx xx  
+000F6A  1  xx xx xx xx  
+000F6E  1  xx xx xx xx  
+000F72  1  xx xx xx xx  
+000F80  1               
+000F80  1               mult100_lo:
+000F80  1  00 64 C8 2C  	.lobytes timestable
+000F84  1  90 F4 58 BC  
+000F88  1  20 84 E8 4C  
+000F8C  1  B0 14 78 DC  
+000F90  1  40 A4 08 6C  
+000F94  1  D0 34 98 FC  
+000F98  1  60 C4 28 8C  
+000F9C  1  F0 54 B8 1C  
+000FA0  1  80 E4 48 AC  
+000FA4  1  10 74 D8 3C  
+000FA8  1  A0 04 68 CC  
+000FAC  1  30 94 F8 5C  
+000FB0  1  C0 24 88 EC  
+000FB4  1  50 B4 18 7C  
+000FB8  1  E0 44 A8 0C  
+000FBC  1  70 D4 38 9C  
+000FC0  1  00 64 C8 2C  
+000FC4  1  90 F4 58 BC  
+000FC8  1  20 84 E8 4C  
+000FCC  1  B0 14 78 DC  
+000FD0  1  40 A4 08 6C  
+000FD4  1  D0 34 98 FC  
+000FD8  1  60 C4 28 8C  
+000FDC  1  F0 54 B8 1C  
+000FE0  1  80 E4 48 AC  
+001080  1               mult100_hi:
+001080  1  00 00 00 01  	.hibytes timestable
+001084  1  01 01 02 02  
+001088  1  03 03 03 04  
+00108C  1  04 05 05 05  
+001090  1  06 06 07 07  
+001094  1  07 08 08 08  
+001098  1  09 09 0A 0A  
+00109C  1  0A 0B 0B 0C  
+0010A0  1  0C 0C 0D 0D  
+0010A4  1  0E 0E 0E 0F  
+0010A8  1  0F 10 10 10  
+0010AC  1  11 11 11 12  
+0010B0  1  12 13 13 13  
+0010B4  1  14 14 15 15  
+0010B8  1  15 16 16 17  
+0010BC  1  17 17 18 18  
+0010C0  1  19 19 19 1A  
+0010C4  1  1A 1A 1B 1B  
+0010C8  1  1C 1C 1C 1D  
+0010CC  1  1D 1E 1E 1E  
+0010D0  1  1F 1F 20 20  
+0010D4  1  20 21 21 21  
+0010D8  1  22 22 23 23  
+0010DC  1  23 24 24 25  
+0010E0  1  25 25 26 26  
+001180  1               
+001180  1               
+001180  1               ; data
+001180  1               
+001180  1               mp_a:
+001180  1               	.org	*+bin_len
+001322  1               mp_b:
+001322  1               	.org	*+bin_len
+0014C4  1               mp_x:
+0014C4  1               	.org	*+bin_len
+001666  1               mp_y:
+001666  1               	.org	*+bin_len
+001808  1               
+001808  1               end:
+001808  1               
